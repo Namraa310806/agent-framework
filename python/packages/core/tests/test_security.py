@@ -1435,6 +1435,316 @@ class TestPolicyEnforcementMiddleware:
         assert isinstance(replay_context.result, Content)
         assert replay_context.result.type == "function_approval_request"
 
+    async def test_unconsumed_approvals_cleaned_on_session_mismatch(self, mock_function):
+        """Pending approvals from ended sessions are cleaned up when a new session uses the same call_id.
+
+        Regression test for issue #7890: unconsumed approvals accumulated without bound. The fix
+        leverages the session binding from PR #6966 to clean up stale entries when a call_id is
+        reused in a different session.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(approval_on_violation=True)
+
+        # Arrange: request approval in session A, but never approve it (simulating user abandonment).
+        session_a = AgentSession(session_id="session-a")
+        request_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session_a,
+        )
+        request_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        request_context.metadata["call_id"] = "call-stale"
+
+        async def stop_before_execute() -> None:
+            pytest.fail("Tool execution should not continue before approval")
+
+        with pytest.raises(MiddlewareTermination):
+            await middleware.process(request_context, stop_before_execute)
+
+        # Assert: the pending approval exists with session-a
+        assert "call-stale" in middleware._pending_policy_approvals
+        original_entry = middleware._pending_policy_approvals["call-stale"]
+        assert original_entry.session_key == "session-a"
+
+        # Act: the same call_id is reused in session B (simulating a new interaction/session).
+        session_b = AgentSession(session_id="session-b")
+        mismatch_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session_b,
+        )
+        mismatch_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        mismatch_context.metadata["call_id"] = "call-stale"
+
+        async def execute() -> None:
+            pytest.fail("Tool should not execute without fresh approval")
+
+        # Assert: the stale approval is cleaned up and a fresh approval is requested
+        with pytest.raises(MiddlewareTermination):
+            await middleware.process(mismatch_context, execute)
+        assert isinstance(mismatch_context.result, Content)
+        assert mismatch_context.result.type == "function_approval_request"
+        # The stale entry was removed and replaced with a new one for session-b
+        assert "call-stale" in middleware._pending_policy_approvals
+        new_entry = middleware._pending_policy_approvals["call-stale"]
+        assert new_entry.session_key == "session-b"
+        # Verify it's a different entry (new object, not the old one)
+        assert new_entry is not original_entry
+
+    async def test_max_pending_approvals_bounds_growth(self, mock_function):
+        """When max_pending_approvals is set, growth is bounded by FIFO eviction.
+
+        Regression test for issue #7890: long-running sessions with many unconsumed
+        approvals should not grow without bound. The max_pending_approvals parameter
+        provides a safety mechanism with a sensible default.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(
+            approval_on_violation=True,
+            max_pending_approvals=10,  # Small limit for testing
+        )
+
+        session = AgentSession(session_id="test-session")
+
+        # Create 20 unique call_ids with policy violations, never approving them
+        for i in range(20):
+            call_id = f"call-{i}"
+            context = FunctionInvocationContext(
+                function=mock_function,
+                arguments=mock_function.args_schema(arg="test"),
+                session=session,
+            )
+            context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+            context.metadata["call_id"] = call_id
+
+            async def stop_before_execute():
+                pytest.fail("Tool execution should not continue before approval")
+
+            with pytest.raises(MiddlewareTermination):
+                await middleware.process(context, stop_before_execute)
+
+        # Assert: growth is bounded to max_pending_approvals
+        assert len(middleware._pending_policy_approvals) == 10
+        # The oldest entries (call-0 through call-9) should have been evicted
+        for i in range(10):
+            assert f"call-{i}" not in middleware._pending_policy_approvals
+        # The newest entries (call-10 through call-19) should remain
+        for i in range(10, 20):
+            assert f"call-{i}" in middleware._pending_policy_approvals
+
+    async def test_default_max_pending_approvals_bounds_growth(self, mock_function):
+        """The default max_pending_approvals=1000 bounds growth without configuration.
+
+        Regression test for issue #7890: the fix should work by default without
+        requiring users to configure max_pending_approvals.
+        """
+        # Use default constructor (no max_pending_approvals specified)
+        middleware = PolicyEnforcementFunctionMiddleware(approval_on_violation=True)
+
+        session = AgentSession(session_id="test-session")
+
+        # Create 1500 unique call_ids (exceeds default 1000)
+        for i in range(1500):
+            call_id = f"call-{i}"
+            context = FunctionInvocationContext(
+                function=mock_function,
+                arguments=mock_function.args_schema(arg="test"),
+                session=session,
+            )
+            context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+            context.metadata["call_id"] = call_id
+
+            async def stop_before_execute():
+                pytest.fail("Tool execution should not continue before approval")
+
+            with pytest.raises(MiddlewareTermination):
+                await middleware.process(context, stop_before_execute)
+
+        # Assert: growth is bounded to default 1000
+        assert len(middleware._pending_policy_approvals) == 1000
+
+    async def test_max_pending_approvals_none_disables_limit(self, mock_function):
+        """Setting max_pending_approvals=None disables the limit for backward compatibility.
+
+        This allows users who need unbounded growth (e.g., very long sessions with
+        many legitimate pending approvals) to opt out of the safety mechanism.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(
+            approval_on_violation=True,
+            max_pending_approvals=None,  # Disable limit
+        )
+
+        session = AgentSession(session_id="test-session")
+
+        # Create 100 unique call_ids
+        for i in range(100):
+            call_id = f"call-{i}"
+            context = FunctionInvocationContext(
+                function=mock_function,
+                arguments=mock_function.args_schema(arg="test"),
+                session=session,
+            )
+            context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+            context.metadata["call_id"] = call_id
+
+            async def stop_before_execute():
+                pytest.fail("Tool execution should not continue before approval")
+
+            with pytest.raises(MiddlewareTermination):
+                await middleware.process(context, stop_before_execute)
+
+        # Assert: no limit enforced, all 100 entries remain
+        assert len(middleware._pending_policy_approvals) == 100
+
+    async def test_fifo_eviction_preserves_recent_approvals(self, mock_function):
+        """FIFO eviction preserves the most recent pending approvals for user approval.
+
+        Regression test for issue #7890: when the limit is exceeded, the oldest
+        entries are evicted, preserving the most recent ones that the user is
+        likely to approve.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(
+            approval_on_violation=True,
+            max_pending_approvals=5,
+        )
+
+        session = AgentSession(session_id="test-session")
+
+        # Create 10 unique call_ids
+        for i in range(10):
+            call_id = f"call-{i}"
+            context = FunctionInvocationContext(
+                function=mock_function,
+                arguments=mock_function.args_schema(arg="test"),
+                session=session,
+            )
+            context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+            context.metadata["call_id"] = call_id
+
+            async def stop_before_execute():
+                pytest.fail("Tool execution should not continue before approval")
+
+            with pytest.raises(MiddlewareTermination):
+                await middleware.process(context, stop_before_execute)
+
+        # Assert: only the 5 most recent entries remain (call-5 through call-9)
+        assert len(middleware._pending_policy_approvals) == 5
+        for i in range(5):
+            assert f"call-{i}" not in middleware._pending_policy_approvals
+        for i in range(5, 10):
+            assert f"call-{i}" in middleware._pending_policy_approvals
+
+        # Verify that one of the preserved approvals can still be used
+        preserved_call_id = "call-7"
+        approval_request = middleware._pending_policy_approvals[preserved_call_id]
+        assert approval_request.session_key == "test-session"
+
+    async def test_valid_approval_still_works_end_to_end(self, mock_function):
+        """A valid approval still executes the tool after the cleanup fix is applied.
+
+        Regression test to ensure the cleanup mechanism does not over-aggressively remove
+        live approvals that should still work.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(approval_on_violation=True)
+
+        # Arrange: request approval in a session
+        session = AgentSession(session_id="test-session")
+        request_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session,
+        )
+        request_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        request_context.metadata["call_id"] = "call-valid"
+
+        async def stop_before_execute() -> None:
+            pytest.fail("Tool execution should not continue before approval")
+
+        with pytest.raises(MiddlewareTermination):
+            await middleware.process(request_context, stop_before_execute)
+
+        approval_request = request_context.result
+        assert isinstance(approval_request, Content)
+
+        # Act: approve and replay in the SAME session
+        replay_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session,
+        )
+        replay_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        replay_context.metadata["call_id"] = "call-valid"
+        replay_context.metadata["approval_response"] = approval_request.to_function_approval_response(True)
+
+        executed = False
+
+        async def execute() -> None:
+            nonlocal executed
+            executed = True
+
+        # Assert: the approval is consumed and the tool executes
+        await middleware.process(replay_context, execute)
+        assert executed is True
+        assert "call-valid" not in middleware._pending_policy_approvals
+
+    async def test_approval_isolation_preserved_after_cleanup_fix(self, mock_function):
+        """Approval isolation from PR #6966 remains intact after the cleanup fix.
+
+        Regression test to ensure the session-mismatch cleanup does not weaken the
+        session binding property: an approval from one session cannot authorize a call
+        in another session.
+        """
+        middleware = PolicyEnforcementFunctionMiddleware(approval_on_violation=True)
+
+        # Arrange: request and grant approval in session A
+        session_a = AgentSession(session_id="session-a")
+        request_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session_a,
+        )
+        request_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        request_context.metadata["call_id"] = "call-isolation"
+
+        async def stop_before_execute() -> None:
+            pytest.fail("Tool execution should not continue before approval")
+
+        with pytest.raises(MiddlewareTermination):
+            await middleware.process(request_context, stop_before_execute)
+
+        approval_request = request_context.result
+        assert isinstance(approval_request, Content)
+        original_entry = middleware._pending_policy_approvals["call-isolation"]
+        assert original_entry.session_key == "session-a"
+
+        # Act: try to use the approval in session B
+        session_b = AgentSession(session_id="session-b")
+        cross_session_context = FunctionInvocationContext(
+            function=mock_function,
+            arguments=mock_function.args_schema(arg="test"),
+            session=session_b,
+        )
+        cross_session_context.metadata["context_label"] = ContentLabel(integrity=IntegrityLabel.UNTRUSTED)
+        cross_session_context.metadata["call_id"] = "call-isolation"
+        cross_session_context.metadata["approval_response"] = approval_request.to_function_approval_response(True)
+
+        executed = False
+
+        async def execute() -> None:
+            nonlocal executed
+            executed = True
+
+        # Assert: cross-session replay is rejected (cleanup removes stale entry, then re-requests)
+        with pytest.raises(MiddlewareTermination):
+            await middleware.process(cross_session_context, execute)
+        assert executed is False
+        assert isinstance(cross_session_context.result, Content)
+        assert cross_session_context.result.type == "function_approval_request"
+        # The stale entry was cleaned up and replaced with a new one for session-b
+        assert "call-isolation" in middleware._pending_policy_approvals
+        new_entry = middleware._pending_policy_approvals["call-isolation"]
+        assert new_entry.session_key == "session-b"
+        # Verify it's a different entry (cleanup happened)
+        assert new_entry is not original_entry
+
 
 class TestAutomaticHiding:
     """Tests for automatic variable hiding functionality."""

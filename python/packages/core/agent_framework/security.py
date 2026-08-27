@@ -1674,21 +1674,22 @@ class PolicyEnforcementFunctionMiddleware(FunctionMiddleware):
     def __init__(
         self,
         allow_untrusted_tools: set[str] | None = None,
-        block_on_violation: bool = True,
-        enable_audit_log: bool = True,
         approval_on_violation: bool = False,
+        block_on_violation: bool = False,
+        enable_audit_log: bool = False,
+        max_pending_approvals: int = 1000,
     ) -> None:
-        """Initialize PolicyEnforcementFunctionMiddleware.
+        """Initialize the policy enforcement middleware.
 
         Args:
-            allow_untrusted_tools: Set of tool names allowed to execute in an untrusted context.
-            block_on_violation: Whether to block execution on policy violations.
-                Ignored if approval_on_violation is True.
-            enable_audit_log: Whether to maintain an audit log of violations.
-            approval_on_violation: Whether to request user approval instead of blocking
-                when a policy violation is detected. If True, the middleware will return
-                a special result that triggers an approval request in the UI. After user
-                approval, the tool will execute with a warning about untrusted context.
+            allow_untrusted_tools: Set of tool names that can execute in UNTRUSTED context.
+            approval_on_violation: If True, request user approval for policy violations instead of blocking.
+            block_on_violation: If True, block tool calls that violate policy (default behavior when approval_on_violation is False).
+            enable_audit_log: If True, log all policy violations to self.audit_log.
+            max_pending_approvals: Maximum number of pending approvals to prevent unbounded growth (issue #7890).
+                Defaults to 1000. When the limit is exceeded, oldest entries are evicted FIFO.
+                Set to None to disable the limit (not recommended for production use).
+                This is a safety mechanism for long-running sessions with many unconsumed approvals.
         """
         self.allow_untrusted_tools = allow_untrusted_tools or set()
         self.approval_on_violation = approval_on_violation
@@ -1702,6 +1703,7 @@ class PolicyEnforcementFunctionMiddleware(FunctionMiddleware):
         # call_id key and consume-on-use, an approval cannot re-authorize a repeated call, a
         # different function, changed arguments, a different security label, or a different session.
         self._pending_policy_approvals: dict[str, _PendingPolicyApproval] = {}
+        self._max_pending_approvals = max_pending_approvals
 
     def _get_call_id(self, context: FunctionInvocationContext) -> str:
         """Get the tool call id for this invocation context."""
@@ -1843,6 +1845,21 @@ class PolicyEnforcementFunctionMiddleware(FunctionMiddleware):
         pending = self._pending_policy_approvals.get(call_id)
         if pending is None:
             return False
+
+        # Clean up stale approvals from ended sessions: if the current session differs from
+        # the session the approval was requested in, the pending entry can never be consumed
+        # (approvals are session-bound per PR #6966), so remove it to prevent unbounded growth.
+        # This check runs before the approval_response check so cleanup happens even when
+        # a call_id is reused without an approval response.
+        current_session_key = self._session_key(context)
+        if pending.session_key != current_session_key:
+            logger.debug(
+                f"Cleaning up stale pending approval for call_id '{call_id}': "
+                f"session changed from '{pending.session_key}' to '{current_session_key}'"
+            )
+            self._pending_policy_approvals.pop(call_id, None)
+            return False
+
         approval_response = context.metadata.get("approval_response")
         if not (
             isinstance(approval_response, Content)
@@ -1900,6 +1917,16 @@ class PolicyEnforcementFunctionMiddleware(FunctionMiddleware):
         )
         call_id = self._get_call_id(context)
         if call_id:
+            # Enforce bounded growth if max_pending_approvals is set (issue #7890)
+            # When the limit is exceeded, evict the oldest entry (FIFO) to prevent
+            # unbounded accumulation of unconsumed approvals in long-running sessions.
+            if self._max_pending_approvals is not None and len(self._pending_policy_approvals) >= self._max_pending_approvals:
+                oldest_call_id = next(iter(self._pending_policy_approvals))
+                logger.debug(
+                    f"Removing oldest pending approval '{oldest_call_id}' to enforce "
+                    f"max_pending_approvals limit ({self._max_pending_approvals})"
+                )
+                del self._pending_policy_approvals[oldest_call_id]
             self._pending_policy_approvals[call_id] = self._pending_record(context, violations)
         additional_properties: dict[str, Any] = {
             "policy_violation": True,
