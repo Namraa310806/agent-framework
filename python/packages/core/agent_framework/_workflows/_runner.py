@@ -228,8 +228,10 @@ class RunnerImpl:
 
         message_batches = await self._ctx.drain_messages()
         await gather_cancelling_siblings_on_error(
-            *(_deliver_messages(source_executor_id, source_messages)
-              for source_executor_id, source_messages in message_batches.items())
+            *(
+                _deliver_messages(source_executor_id, source_messages)
+                for source_executor_id, source_messages in message_batches.items()
+            )
         )
 
     async def _prepare_checkpoint_state(self) -> None:

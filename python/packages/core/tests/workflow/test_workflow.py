@@ -693,6 +693,7 @@ async def test_workflow_discards_pending_state_after_failed_superstep():
 @dataclass
 class FanOutTestMessage:
     """Message for fan-out state leak test."""
+
     should_fail: bool
 
 
@@ -756,18 +757,16 @@ async def test_workflow_discards_pending_state_after_fanout_failure():
         id="slow_target", b_started=b_started, release_b=release_b, b_task_ref=b_task_ref
     )
 
-    workflow = (
-        WorkflowBuilder(start_executor=source)
-        .add_fan_out_edges(source, [failing_target, slow_target])
-        .build()
-    )
+    workflow = WorkflowBuilder(start_executor=source).add_fan_out_edges(source, [failing_target, slow_target]).build()
 
     # Verify topology: single FanOutEdgeGroup with two targets under one edge_runner
     from agent_framework._workflows._edge import FanOutEdgeGroup
+
     fan_out_groups = [eg for eg in workflow.edge_groups if isinstance(eg, FanOutEdgeGroup)]
     assert len(fan_out_groups) == 1, f"Expected 1 FanOutEdgeGroup, got {len(fan_out_groups)}"
-    assert fan_out_groups[0].target_ids == [failing_target.id, slow_target.id], \
+    assert fan_out_groups[0].target_ids == [failing_target.id, slow_target.id], (
         f"Expected targets [{failing_target.id}, {slow_target.id}], got {fan_out_groups[0].target_ids}"
+    )
 
     run_task = asyncio.create_task(workflow.run(FanOutTestMessage(should_fail=True)))
     with pytest.raises(RuntimeError, match="target A failed"):
@@ -776,7 +775,7 @@ async def test_workflow_discards_pending_state_after_fanout_failure():
     release_b.set()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await asyncio.wait_for(b_task_ref[0], timeout=0.5)
-    
+
     b_task_ref.clear()
 
     result = await workflow.run(FanOutTestMessage(should_fail=False))
