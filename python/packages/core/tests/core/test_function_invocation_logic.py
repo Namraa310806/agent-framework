@@ -59,6 +59,48 @@ def _build_approved_tool_roundtrip(
     return function_call, approval_request, approval_response
 
 
+def test_collect_unanswered_replacement_requests_correlates_reused_call_id_by_occurrence() -> None:
+    """A resolved replacement must not consume a pending reused-call-id sibling."""
+    from agent_framework._tools import _collect_unanswered_approval_requests
+
+    first_call = Content.from_function_call(
+        call_id="reused",
+        name="guarded",
+        arguments="{}",
+        id="occurrence-1",
+    )
+    first_request = Content.from_function_approval_request(
+        id="replacement-1",
+        function_call=first_call,
+        additional_properties={"_replacement_approval_request": True},
+    )
+    second_call = Content.from_function_call(
+        call_id="reused",
+        name="guarded",
+        arguments="{}",
+        id="occurrence-2",
+    )
+    second_request = Content.from_function_approval_request(
+        id="replacement-2",
+        function_call=second_call,
+        additional_properties={"_replacement_approval_request": True},
+    )
+    second_response = Content.from_function_approval_response(
+        approved=True,
+        id="occurrence-2",
+        function_call=second_call,
+    )
+
+    unanswered = _collect_unanswered_approval_requests([
+        Message(role="assistant", contents=[first_request]),
+        Message(role="assistant", contents=[second_request]),
+        Message(role="user", contents=[second_response]),
+        Message(role="tool", contents=[Content.from_function_result(call_id="reused", result="done")]),
+    ])
+
+    assert unanswered == [first_request]
+
+
 def test_session_approval_binding_rebinds_consumes_and_rejects_duplicates() -> None:
     """Session binding must use the recorded call and honor one response once."""
     from agent_framework._tools import (
@@ -537,6 +579,15 @@ async def test_streaming_interleaved_indexed_call_fragments_coalesce_by_occurren
         assert streamed_by_index[index][0] == streamed_by_index[index][1]
         assert streamed_by_index[index][0][1] == provider_call_id
     assert caught == []
+
+
+def test_loading_pending_approval_requests_does_not_create_state() -> None:
+    from agent_framework._tools import _load_pending_approval_requests
+
+    session = AgentSession(session_id="approval-read-only")
+
+    assert _load_pending_approval_requests(session) == {}
+    assert "tool_approval" not in session.state
 
 
 def test_occurrence_aware_approval_rejects_stale_reused_call_id_response(caplog: pytest.LogCaptureFixture) -> None:
