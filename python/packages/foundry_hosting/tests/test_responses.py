@@ -1576,6 +1576,7 @@ class TestHealthCheck:
 # region Non-streaming
 
 
+@pytest.mark.xdist_group("session_isolation")
 class TestNonStreaming:
     """
     Non-streaming here means that the client requested a non-streaming response, instead of
@@ -3540,6 +3541,7 @@ def _make_multi_response_agent(
     return agent
 
 
+@pytest.mark.xdist_group("session_isolation")
 class TestMultiTurnMixedContent:
     """End-to-end multi-turn tests with mixed text and non-text content types."""
 
@@ -4513,6 +4515,7 @@ class TestFunctionApprovalConversion:
         assert c.approved is False
 
 
+@pytest.mark.xdist_group("session_isolation")
 class TestFunctionApprovalRoundTrip:
     """End-to-end round-trip tests for the function approval flow.
 
@@ -4889,6 +4892,7 @@ class TestAgentLifecycle:
         assert agent.__aenter__.await_count == 2
 
 
+@pytest.mark.xdist_group("session_isolation")
 class TestOAuthConsentSurfacing:
     async def test_non_streaming_consent_error_emits_oauth_output_item(self) -> None:
         agent = _make_agent(

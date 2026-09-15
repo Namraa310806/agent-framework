@@ -206,6 +206,8 @@ class HttpRequestActionExecutor(DeclarativeActionExecutor):
 
         # Non-success path: still publish headers diagnostically, then raise.
         self._assign_response_headers(state, result)
+        # Commit the state before raising so headers are persisted even on error
+        ctx.state.commit()
         raise DeclarativeActionError(f"HTTP request to '{url}' failed with status code {result.status_code}.")
 
     # ----- Field resolution ----------------------------------------------------
