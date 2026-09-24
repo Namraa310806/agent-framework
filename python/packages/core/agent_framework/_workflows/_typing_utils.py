@@ -2,7 +2,7 @@
 
 import sys
 import typing
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, is_dataclass
 from types import ModuleType, UnionType
 from typing import Any, Literal, TypeGuard, Union, cast, get_args, get_origin, get_type_hints
@@ -53,6 +53,21 @@ def contains_typevar(annotation: Any) -> bool:
         return True
 
     return any(contains_typevar(arg) for arg in get_args(annotation))
+
+
+def _resolve_function_annotations(  # pyright: ignore[reportUnusedFunction]
+    func: Callable[..., Any], params: Sequence[Any]
+) -> dict[str, Any]:
+    """Resolve function annotations and fall back to raw parameter annotations on failure.
+
+    ``typing.get_type_hints`` resolves postponed annotations, but a single unresolved
+    forward reference prevents it from returning any hints. Keeping the raw annotations
+    in that case lets the caller produce its normal, parameter-specific validation error.
+    """
+    try:
+        return get_type_hints(func)
+    except (NameError, AttributeError, RecursionError):
+        return {param.name: param.annotation for param in params}
 
 
 def is_chat_agent(agent: Any) -> TypeGuard[Agent]:
@@ -454,6 +469,11 @@ def is_type_compatible(source_type: type | UnionType | Any, target_type: type | 
     """
     # Case 0: target_type is Any - always compatible
     if target_type is Any:
+        return True
+
+    # Case 0b: source_type is Any - the value can be of any type, so it is compatible with every
+    # target, the same way static type checkers treat Any.
+    if source_type is Any:
         return True
 
     # Case 1: exact type match

@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import json
 import sys
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextvars import ContextVar
 from typing import Any, Literal, TypeAlias
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,10 +18,11 @@ from agent_framework import FunctionInvocationContext, MCPStreamableHTTPTool
 from agent_framework.exceptions import ToolException, ToolExecutionException
 
 MCPHTTPServer: TypeAlias = tuple[httpx.AsyncClient, list[httpx.Request], dict[str, list[str]]]
+MCPHTTPClientFactory: TypeAlias = tuple[Callable[..., httpx.AsyncClient], list[httpx.Request], dict[str, list[str]]]
 
 
 @pytest.fixture
-async def mcp_http_server() -> AsyncIterator[MCPHTTPServer]:
+async def mcp_http_client_factory() -> AsyncIterator[MCPHTTPClientFactory]:
     requests: list[httpx.Request] = []
     writes: dict[str, list[str]] = {"token-a": [], "token-A": [], "token-b": [], "token-c": []}
 
@@ -58,7 +60,17 @@ async def mcp_http_server() -> AsyncIterator[MCPHTTPServer]:
                 "tools": [
                     {
                         "name": "record",
-                        "inputSchema": {"type": "object", "properties": {"marker": {"type": "string"}}},
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "marker": {"type": "string"},
+                                **(
+                                    {"credential": {"type": "string"}}
+                                    if request.headers.get("X-Test-Declare-Credential") == "true"
+                                    else {}
+                                ),
+                            },
+                        },
                     },
                     {
                         "name": f"{principal}-only",
@@ -95,18 +107,44 @@ async def mcp_http_server() -> AsyncIterator[MCPHTTPServer]:
             return httpx.Response(202)
         return httpx.Response(200, headers=headers, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handle), event_hooks={"request": [record_request]}
-    ) as client:
+    async_client = httpx.AsyncClient
+    clients: list[httpx.AsyncClient] = []
+
+    def create_client(*, response_cookies: dict[str, str] | None = None, **kwargs: Any) -> httpx.AsyncClient:
+        async def handle_with_cookies(request: httpx.Request) -> httpx.Response:
+            response = await handle(request)
+            if response_cookies and request.method == "POST":
+                method = json.loads(request.content).get("method")
+                if method in response_cookies:
+                    response.headers["Set-Cookie"] = response_cookies[method]
+            return response
+
+        client = async_client(transport=httpx.MockTransport(handle_with_cookies), **kwargs)
+        client.event_hooks["request"].insert(0, record_request)
+        clients.append(client)
+        return client
+
+    try:
+        yield create_client, requests, writes
+    finally:
+        for client in clients:
+            await client.aclose()
+
+
+@pytest.fixture
+async def mcp_http_server(mcp_http_client_factory: MCPHTTPClientFactory) -> AsyncIterator[MCPHTTPServer]:
+    create_client, requests, writes = mcp_http_client_factory
+    async with create_client() as client:
         yield client, requests, writes
 
 
-def _tool(client: httpx.AsyncClient, principal: str) -> MCPStreamableHTTPTool:
+def _tool(client: httpx.AsyncClient, principal: str, *, declare_credential: bool = False) -> MCPStreamableHTTPTool:
     return MCPStreamableHTTPTool(
         name=principal,
         url="https://mcp.example/mcp",
         http_client=client,
         load_prompts=False,
+        static_headers={"X-Test-Declare-Credential": "true"} if declare_credential else None,
         header_provider=lambda kwargs: {"Authorization": kwargs.get("credential", principal)},
     )
 
@@ -125,6 +163,38 @@ def _requests_for_method(requests: list[httpx.Request], method: str) -> list[htt
         for request in requests
         if request.method == "POST" and json.loads(request.content).get("method") == method
     ]
+
+
+async def test_owned_client_does_not_replay_response_cookie_across_principals(
+    mcp_http_client_factory: MCPHTTPClientFactory,
+) -> None:
+    create_client, requests, _ = mcp_http_client_factory
+    principal = ContextVar("principal", default="token-a")
+    response_cookies = {"tools/call": "regression_session=token-a; Path=/; Secure; HttpOnly"}
+
+    def create_owned_client(**kwargs: Any) -> httpx.AsyncClient:
+        return create_client(response_cookies=response_cookies, **kwargs)
+
+    tool = MCPStreamableHTTPTool(
+        name="owned",
+        url="https://mcp.example/mcp",
+        load_prompts=False,
+        header_provider=lambda _: {"Authorization": principal.get()},
+    )
+    with patch("httpx.AsyncClient", side_effect=create_owned_client):
+        async with tool:
+            await tool.call_tool("record")
+            response_cookies.clear()
+            token = principal.set("token-b")
+            try:
+                await tool.call_tool("record")
+            finally:
+                principal.reset(token)
+
+    calls = _calls(requests)
+    assert [request.headers["Authorization"] for request in calls] == ["token-a", "token-b"]
+    assert "Cookie" not in calls[0].headers
+    assert "regression_session=token-a" not in calls[1].headers.get("Cookie", "")
 
 
 @pytest.mark.parametrize("principals", [("token-a", "token-b"), ("token-b", "token-a")])
@@ -240,20 +310,50 @@ async def test_transport_failure_cleans_up_hooks_and_owned_client(
         await tool.close()
 
 
-async def test_owned_client_is_closed_after_successful_session(mcp_http_server: MCPHTTPServer) -> None:
-    client, _, _ = mcp_http_server
-    original_hooks = list(client.event_hooks["request"])
+@pytest.mark.parametrize("header_source", ["none", "static", "provider"])
+async def test_owned_client_is_closed_after_successful_session(
+    mcp_http_client_factory: MCPHTTPClientFactory, header_source: str
+) -> None:
+    create_client, requests, _ = mcp_http_client_factory
+    clients: list[httpx.AsyncClient] = []
+
+    def create_owned_client(**kwargs: Any) -> httpx.AsyncClient:
+        client = create_client(
+            response_cookies={"tools/call": "implicit_session=previous; Path=/; Secure; HttpOnly"},
+            **kwargs,
+        )
+        client.headers["Authorization"] = "token-a"
+        clients.append(client)
+        return client
+
     tool = MCPStreamableHTTPTool(
         name="owned",
         url="https://mcp.example/mcp",
         load_prompts=False,
-        header_provider=lambda _: {"Authorization": "token-a"},
+        static_headers={"Cookie": "explicit_session=caller"} if header_source == "static" else None,
+        header_provider=(lambda _: {"Authorization": "token-a", "Cookie": "explicit_session=caller"})
+        if header_source == "provider"
+        else None,
     )
-    with patch("httpx.AsyncClient", return_value=client):
+    with patch("httpx.AsyncClient", side_effect=create_owned_client):
         async with tool:
             await tool.call_tool("record")
-    assert client.is_closed
-    assert client.event_hooks["request"] == original_hooks
+            await tool.call_tool("record")
+            assert len(clients) == 1
+            assert tool._httpx_client is clients[0]
+            await tool.connect(reset=True)
+            assert len(clients) == 2
+            assert clients[0].is_closed
+            await tool.call_tool("record")
+    assert len(_calls(requests)) == 3
+    assert all(
+        request.headers.get("Cookie") == ("explicit_session=caller" if header_source != "none" else None)
+        for request in _calls(requests)
+    )
+    assert all(not client.cookies for client in clients)
+    assert all(client.is_closed for client in clients)
+    assert all(len(client.event_hooks["request"]) == 1 for client in clients)
+    assert tool._httpx_client is None
 
 
 async def test_connecting_another_tool_during_a_call_does_not_capture_its_headers(
@@ -454,6 +554,108 @@ async def test_concurrent_callers_use_sessions_bound_to_their_own_headers(mcp_ht
         )
         assert writes["token-a"] == ["first"]
         assert writes["token-b"] == ["second"]
+    finally:
+        await tool.close()
+
+
+@pytest.mark.parametrize("model_credential", ["token-b", ""])
+async def test_generated_tool_keeps_authentication_in_runtime_context(
+    mcp_http_server: MCPHTTPServer, model_credential: str
+) -> None:
+    client, requests, _ = mcp_http_server
+    tool = _tool(client, "token-a", declare_credential=True)
+    try:
+        await tool.connect()
+        function = next(function for function in tool.functions if function.name == "record")
+        arguments = {"marker": "model-value", "credential": model_credential}
+        context = FunctionInvocationContext(
+            function=function, arguments=arguments, kwargs={"credential": "token-a", "marker": "runtime-value"}
+        )
+        await function.invoke(arguments=arguments, context=context)
+
+        call = _calls(requests)[-1]
+        assert call.headers["Authorization"] == "token-a"
+        assert call.headers["mcp-session-id"] == "session-token-a"
+        assert json.loads(call.content)["params"]["arguments"]["marker"] == "model-value"
+        assert json.loads(call.content)["params"]["arguments"]["credential"] == model_credential
+        assert len(_requests_for_method(requests, "initialize")) == 1
+        assert context.kwargs == {"credential": "token-a", "marker": "runtime-value"}
+    finally:
+        await tool.close()
+
+
+async def test_generated_tool_does_not_supply_model_only_authentication(mcp_http_server: MCPHTTPServer) -> None:
+    client, requests, _ = mcp_http_server
+    tool = _tool(client, "token-a", declare_credential=True)
+    try:
+        await tool.connect()
+        function = next(function for function in tool.functions if function.name == "record")
+        arguments = {"marker": "model-value", "credential": "token-b"}
+        context = FunctionInvocationContext(function=function, arguments=arguments, kwargs={})
+        await function.invoke(arguments=arguments, context=context)
+        assert _calls(requests)[-1].headers["Authorization"] == "token-a"
+
+        # Direct calls remain host-controlled and must not inherit the generated invocation's context.
+        await tool.call_tool("record", credential="token-b", marker="direct")
+        assert _calls(requests)[-1].headers["Authorization"] == "token-b"
+    finally:
+        await tool.close()
+
+
+@pytest.mark.parametrize("failure", [KeyError, asyncio.CancelledError])
+async def test_generated_tool_auth_context_is_cleared_after_failure(
+    mcp_http_server: MCPHTTPServer, failure: type[BaseException]
+) -> None:
+    client, requests, _ = mcp_http_server
+
+    def headers(kwargs: dict[str, Any]) -> dict[str, str]:
+        if "credential" not in kwargs:
+            raise failure("credential")
+        return {"Authorization": kwargs["credential"]}
+
+    tool = MCPStreamableHTTPTool(
+        name="runtime-auth",
+        url="https://mcp.example/mcp",
+        http_client=client,
+        load_prompts=False,
+        header_provider=headers,
+    )
+    tool._seed_connection_kwargs({"credential": "token-a"})
+    try:
+        await tool.connect()
+        function = next(function for function in tool.functions if function.name == "record")
+        arguments = {"credential": "token-b"}
+        context = FunctionInvocationContext(function=function, arguments=arguments, kwargs={})
+        with pytest.raises(failure, match="credential"):
+            await function.invoke(arguments=arguments, context=context)
+        assert not _calls(requests)
+
+        await tool.call_tool("record", credential="token-b")
+        assert _calls(requests)[-1].headers["Authorization"] == "token-b"
+    finally:
+        await tool.close()
+
+
+async def test_concurrent_generated_calls_keep_separate_auth_contexts(mcp_http_server: MCPHTTPServer) -> None:
+    client, requests, _ = mcp_http_server
+    tool = _tool(client, "token-a", declare_credential=True)
+    try:
+        await tool.connect()
+        function = next(function for function in tool.functions if function.name == "record")
+
+        async def invoke(principal: str, model_principal: str) -> None:
+            arguments = {"marker": principal, "credential": model_principal}
+            context = FunctionInvocationContext(
+                function=function, arguments=arguments, kwargs={"credential": principal}
+            )
+            await function.invoke(arguments=arguments, context=context)
+
+        await asyncio.gather(invoke("token-a", "token-b"), invoke("token-b", "token-a"))
+        calls = _calls(requests)
+        assert len(calls) == 2
+        for request in calls:
+            assert request.headers["Authorization"] == json.loads(request.content)["params"]["arguments"]["marker"]
+            assert request.headers["mcp-session-id"] == f"session-{request.headers['Authorization']}"
     finally:
         await tool.close()
 
