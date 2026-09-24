@@ -787,10 +787,10 @@ async def test_workflow_discards_pending_state_after_fanout_failure():
         f"Expected targets [{failing_target.id}, {slow_target.id}], got {fan_out_groups[0].target_ids}"
     )
 
-    async def _run_workflow():
+    async def _run_workflow() -> WorkflowRunResult:
         return await workflow.run(FanOutTestMessage(should_fail=True))
 
-    run_task = asyncio.create_task(_run_workflow())
+    run_task: asyncio.Task[WorkflowRunResult] = asyncio.create_task(_run_workflow())
     with pytest.raises(RuntimeError, match="target A failed"):
         await asyncio.wait_for(run_task, timeout=5.0)
 
